@@ -1,0 +1,13 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      # Mount host gcloud ADC credentials — no service account key needed
+      - ~/.config/gcloud:/root/.config/gcloud:ro
+    environment:
+      GCP_PROJECT: pro-landing-478712-c5
+      GCP_REGION: us-central1
+      # Tells google-auth where to find ADC inside the container
+      GOOGLE_CLOUD_PROJECT: pro-landing-478712-c5
