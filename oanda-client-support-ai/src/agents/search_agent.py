@@ -312,28 +312,47 @@ class SearchAgent(BaseAgent):
             if clean.startswith(_ALLOWED_PREFIX) and clean not in links:
                 links.append(clean)
 
-        # ── Strip navigation noise ────────────────────────────────────────────
-        for tag in soup.select(
-            "nav, header, footer, script, style, "
-            "[class*='nav'], [class*='menu'], [class*='sidebar'], "
-            "[class*='breadcrumb'], [class*='footer'], [class*='header']"
-        ):
-            tag.decompose()
-
-        # ── Extract title ─────────────────────────────────────────────────────
+        # ── Extract title (before stripping) ─────────────────────────────────
         title_tag = soup.find("title")
         title = title_tag.get_text(strip=True) if title_tag else url
 
-        # ── Extract main body text ────────────────────────────────────────────
+        # ── Extract main body text first, then strip noise ────────────────────
+        # Prefer explicit main landmarks before generic stripping so we don't
+        # accidentally nuke content on JS-heavy / MadCap Flare sites where
+        # [class*='nav'] selectors can match wrapper divs around the body.
         main = (
-            soup.find("main")
-            or soup.find("article")
+            soup.find("div", {"role": "main"})          # <div role="main">
+            or soup.find("main")                         # <main>
+            or soup.find("article")                      # <article>
+            or soup.find("div", attrs={"data-mc-content-body": "True"})  # MadCap
             or soup.find(
                 "div",
-                class_=re.compile(r"\b(content|article|body|main)\b", re.I),
+                id=re.compile(r"\b(main|content|body|article)\b", re.I),
             )
-            or soup.body
+            or soup.find(
+                "div",
+                class_=re.compile(r"(?:^|\s)(content|article|body-container)(?:\s|$)", re.I),
+            )
         )
+
+        if main:
+            # Strip noise only within the identified content node
+            for tag in main.select(
+                "nav, header, footer, script, style, noscript, "
+                ".nocontent, [class*='breadcrumb'], [class*='toolbar'], "
+                "[class*='footer'], [class*='header'], [class*='search']"
+            ):
+                tag.decompose()
+        else:
+            # Fall back: strip noise site-wide, then use body
+            for tag in soup.select(
+                "nav, header, footer, script, style, noscript, "
+                "[id*='nav'], [id*='menu'], [id*='sidebar'], "
+                "[class*='breadcrumb'], [class*='footer'], [class*='header']"
+            ):
+                tag.decompose()
+            main = soup.body
+
         raw_text = main.get_text(separator=" ", strip=True) if main else ""
         text = re.sub(r"\s+", " ", raw_text).strip()
 
