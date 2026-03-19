@@ -1,21 +1,23 @@
 """
-AnswerAgent — uses the Claude API to synthesise a clear, client-ready
+AnswerAgent — uses Gemini via Vertex AI to synthesise a clear, client-ready
 answer from the content retrieved by the SearchAgent.
 
 Implementation notes:
-    - Uses anthropic.AsyncAnthropic with streaming to avoid HTTP timeouts
-      on long answers and to support models with large max_tokens.
-    - Context is capped at _MAX_CONTEXT_CHARS (~2 000 tokens) so that the
-      search excerpts, system prompt, and full answer all fit comfortably
-      inside the model's context window.
-    - If query.language is not "en", an instruction to reply in that
-      language is appended to the system prompt.
-    - ANTHROPIC_API_KEY is read from the environment; python-dotenv loads
-      .env automatically so local runs work without exporting the variable.
+    - Uses google-genai SDK with Vertex AI backend (ADC, no API key needed).
+    - GCP project and region are read from GCP_PROJECT / GCP_REGION env vars
+      (loaded from .env via python-dotenv).
+    - Context is capped at _MAX_CONTEXT_CHARS so the prompt stays well within
+      Gemini's context window.
+    - If query.language is not "en", the system prompt instructs Gemini to
+      reply in that language.
 """
 
-import anthropic
+import os
+
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from google.genai.types import FinishReason
 
 from src.agents.base_agent import BaseAgent
 from src.models.query import ClientQuery
@@ -23,8 +25,10 @@ from src.models.response import AgentResponse, AgentRole, ResponseStatus
 
 load_dotenv()
 
-_MAX_CONTEXT_CHARS = 8_000   # ~2 000 tokens — leaves headroom for prompt + reply
-_MAX_TOKENS = 1_024           # maximum answer length
+_GCP_PROJECT = os.getenv("GCP_PROJECT", "")
+_GCP_REGION = os.getenv("GCP_REGION", "us-central1")
+_MAX_CONTEXT_CHARS = 8_000
+_MAX_TOKENS = 1_024
 
 SYSTEM_PROMPT = """You are a helpful OANDA support specialist.
 Your job is to answer client questions clearly and accurately, based ONLY
@@ -36,14 +40,16 @@ say so honestly and suggest the client contacts OANDA support directly."""
 class AnswerAgent(BaseAgent):
     """
     Synthesises the SearchAgent's results into a clear client-facing answer
-    using the Claude API.
+    using Gemini via Vertex AI.
     """
 
-    def __init__(self, model: str = "claude-opus-4-6", **kwargs):
+    def __init__(self, model: str = "gemini-2.5-flash", **kwargs):
         super().__init__(name="AnswerAgent", **kwargs)
         self.model = model
         self.system_prompt = SYSTEM_PROMPT
-        self._client = anthropic.AsyncAnthropic()   # reads ANTHROPIC_API_KEY from env
+        self._client = genai.Client(
+            vertexai=True, project=_GCP_PROJECT, location=_GCP_REGION
+        )
 
     @property
     def role(self) -> AgentRole:
@@ -63,42 +69,32 @@ class AnswerAgent(BaseAgent):
         query: ClientQuery,
         prior_responses: list[AgentResponse],
     ) -> AgentResponse:
-        """
-        Generate an answer using Claude, grounded in SearchAgent's output.
-
-        Uses streaming + get_final_message() to stay within HTTP timeouts
-        even when max_tokens is large.
-        """
+        """Generate an answer using Gemini, grounded in SearchAgent's output."""
         search_response = self.get_last_response(prior_responses, AgentRole.SEARCH)
         context = search_response.content if search_response else "(no search results)"
         sources = search_response.sources if search_response else []
 
         self._logger.info(f"Generating answer for query: '{query.text[:80]}'")
 
-        # ── Truncate context if needed ────────────────────────────────────────
         truncated = len(context) > _MAX_CONTEXT_CHARS
         if truncated:
             context = context[:_MAX_CONTEXT_CHARS].rsplit("\n", 1)[0]
-            self._logger.debug(
-                f"Context truncated to {len(context)} chars for query {query.query_id}"
-            )
 
         system = self._build_system_prompt(query.language)
         user_message = self._build_user_message(query.text, context, truncated)
 
-        # ── Stream the response (avoids timeout on long answers) ──────────────
-        async with self._client.messages.stream(
+        response = await self._client.aio.models.generate_content(
             model=self.model,
-            max_tokens=_MAX_TOKENS,
-            system=system,
-            messages=[{"role": "user", "content": user_message}],
-        ) as stream:
-            final = await stream.get_final_message()
-
-        answer = next(
-            (block.text for block in final.content if block.type == "text"), ""
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                max_output_tokens=_MAX_TOKENS,
+            ),
         )
-        confidence = 0.9 if final.stop_reason == "end_turn" else 0.6
+
+        answer = response.text or ""
+        finish = response.candidates[0].finish_reason if response.candidates else None
+        confidence = 0.9 if finish == FinishReason.STOP else 0.6
 
         return AgentResponse(
             agent_role=self.role,
@@ -110,9 +106,9 @@ class AnswerAgent(BaseAgent):
                 "model": self.model,
                 "context_length": len(context),
                 "context_truncated": truncated,
-                "input_tokens": final.usage.input_tokens,
-                "output_tokens": final.usage.output_tokens,
-                "stop_reason": final.stop_reason,
+                "input_tokens": response.usage_metadata.prompt_token_count,
+                "output_tokens": response.usage_metadata.candidates_token_count,
+                "finish_reason": str(finish),
             },
         )
 

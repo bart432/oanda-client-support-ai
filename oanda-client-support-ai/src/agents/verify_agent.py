@@ -2,23 +2,17 @@
 VerifyAgent — checks the AnswerAgent's response for accuracy, completeness,
 and compliance before it reaches the client.
 
-Implementation:
-    - Sends (query, source excerpts, draft answer) to Claude with a strict
-      JSON-schema output so the verdict is machine-readable without extra
-      parsing heuristics.
-    - Verdict can be "pass", "corrected", or "escalate":
-        pass      → answer is good as-is; returned with SUCCESS
-        corrected → Claude rewrote the answer to fix issues; SUCCESS
-        escalate  → answer cannot be safely delivered; ESCALATE status
-    - Confidence is reported by Claude and clipped to [0, 1].
-    - OANDA compliance rule (no personalised financial advice) is baked
-      into the system prompt; violations force an "escalate" verdict.
+Uses Gemini via Vertex AI with structured JSON output (response_mime_type +
+response_schema) so the verdict and confidence are machine-readable without
+string parsing.
 """
 
 import json
+import os
 
-import anthropic
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 from src.agents.base_agent import BaseAgent
 from src.models.query import ClientQuery
@@ -26,10 +20,11 @@ from src.models.response import AgentResponse, AgentRole, ResponseStatus
 
 load_dotenv()
 
-_MAX_SOURCE_CHARS = 6_000   # source excerpts are already short, but cap for safety
-_MAX_TOKENS = 1_024
+_GCP_PROJECT = os.getenv("GCP_PROJECT", "")
+_GCP_REGION = os.getenv("GCP_REGION", "us-central1")
+_MAX_SOURCE_CHARS = 6_000
+_MAX_TOKENS = 2_048
 
-# ── JSON schema for the structured verification result ────────────────────────
 _VERIFY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -62,7 +57,6 @@ _VERIFY_SCHEMA = {
         },
     },
     "required": ["verdict", "verified_answer", "confidence", "issues"],
-    "additionalProperties": False,
 }
 
 VERIFY_SYSTEM_PROMPT = """You are a strict quality assurance agent for OANDA support.
@@ -87,11 +81,13 @@ class VerifyAgent(BaseAgent):
     Flags answers requiring human review with ResponseStatus.ESCALATE.
     """
 
-    def __init__(self, model: str = "claude-opus-4-6", **kwargs):
+    def __init__(self, model: str = "gemini-2.5-flash", **kwargs):
         super().__init__(name="VerifyAgent", **kwargs)
         self.model = model
         self.system_prompt = VERIFY_SYSTEM_PROMPT
-        self._client = anthropic.AsyncAnthropic()
+        self._client = genai.Client(
+            vertexai=True, project=_GCP_PROJECT, location=_GCP_REGION
+        )
 
     @property
     def role(self) -> AgentRole:
@@ -113,9 +109,7 @@ class VerifyAgent(BaseAgent):
     ) -> AgentResponse:
         """
         Verify the AnswerAgent's output against the original source material.
-
-        Uses structured JSON output so the verdict and confidence are parsed
-        directly from the schema-constrained response — no regex required.
+        Uses structured JSON output so verdict/confidence are parsed directly.
         """
         answer_response = self.get_last_response(prior_responses, AgentRole.ANSWER)
         search_response = self.get_last_response(prior_responses, AgentRole.SEARCH)
@@ -130,18 +124,20 @@ class VerifyAgent(BaseAgent):
 
         user_message = self._build_user_message(query.text, source_text, answer_text)
 
-        api_response = await self._client.messages.create(
+        response = await self._client.aio.models.generate_content(
             model=self.model,
-            max_tokens=_MAX_TOKENS,
-            system=self.system_prompt,
-            messages=[{"role": "user", "content": user_message}],
-            output_config={"format": {"type": "json_schema", "schema": _VERIFY_SCHEMA}},
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=self.system_prompt,
+                max_output_tokens=_MAX_TOKENS,
+                response_mime_type="application/json",
+                response_schema=_VERIFY_SCHEMA,
+            ),
         )
 
-        raw_json = next(
-            (b.text for b in api_response.content if b.type == "text"), "{}"
-        )
-        result = json.loads(raw_json)
+        if not response.text:
+            raise ValueError("Empty response from model — will retry")
+        result = json.loads(response.text)
 
         verdict = result.get("verdict", "escalate")
         verified_answer = result.get("verified_answer", answer_text)
@@ -172,12 +168,10 @@ class VerifyAgent(BaseAgent):
                 "verdict": verdict,
                 "issues": issues,
                 "original_answer_length": len(answer_text),
-                "input_tokens": api_response.usage.input_tokens,
-                "output_tokens": api_response.usage.output_tokens,
+                "input_tokens": response.usage_metadata.prompt_token_count,
+                "output_tokens": response.usage_metadata.candidates_token_count,
             },
         )
-
-    # ── Private helpers ───────────────────────────────────────────────────────
 
     def _build_user_message(
         self, query_text: str, source_text: str, answer_text: str

@@ -1,5 +1,5 @@
 # Core
-anthropic>=0.40.0
+google-genai>=1.0.0          # Gemini via Vertex AI (replaces anthropic)
 python-dotenv>=1.0.0
 
 # Web scraping (SearchAgent)

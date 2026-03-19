@@ -2,21 +2,17 @@
 RatingAgent — evaluates the entire pipeline run and scores the OANDA
 support process on a scale of 1-5, generating actionable recommendations.
 
-Implementation:
-    - Sends the full pipeline summary (query → search → answer → verify)
-      to Claude with a strict JSON-schema output so the score and lists
-      are machine-readable without regex heuristics.
-    - The integer score is mapped directly to ProcessScore (IntEnum 1-5).
-    - Scores 1-2 are auto-logged as warnings; the Orchestrator can use
-      rating.needs_escalation to route them to a human review queue.
-    - The RatingResult is stored in AgentResponse.metadata["rating_result"]
-      so the Orchestrator can lift it into PipelineResult.rating.
+Uses Gemini via Vertex AI with structured JSON output so the score and all
+recommendation lists are machine-readable without parsing heuristics.
+Scores 1-2 are auto-logged as warnings and set needs_escalation=True.
 """
 
 import json
+import os
 
-import anthropic
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 from src.agents.base_agent import BaseAgent
 from src.models.query import ClientQuery
@@ -25,15 +21,15 @@ from src.models.response import AgentResponse, AgentRole, ResponseStatus
 
 load_dotenv()
 
-_MAX_TOKENS = 1_024
+_GCP_PROJECT = os.getenv("GCP_PROJECT", "")
+_GCP_REGION = os.getenv("GCP_REGION", "us-central1")
+_MAX_TOKENS = 2_048
 
-# ── JSON schema for the structured rating result ──────────────────────────────
 _RATING_SCHEMA = {
     "type": "object",
     "properties": {
         "score": {
             "type": "integer",
-            "enum": [1, 2, 3, 4, 5],
             "description": "Overall process score: 1=Critical, 2=Needs Work, 3=Average, 4=Good, 5=Best Practice",
         },
         "justification": {
@@ -57,7 +53,6 @@ _RATING_SCHEMA = {
         },
     },
     "required": ["score", "justification", "what_works_well", "improvements", "quick_wins"],
-    "additionalProperties": False,
 }
 
 RATING_SYSTEM_PROMPT = """You are a process quality evaluator for OANDA customer support.
@@ -87,11 +82,13 @@ class RatingAgent(BaseAgent):
     so the Orchestrator can extract it into PipelineResult.rating.
     """
 
-    def __init__(self, model: str = "claude-opus-4-6", **kwargs):
+    def __init__(self, model: str = "gemini-2.5-flash", **kwargs):
         super().__init__(name="RatingAgent", **kwargs)
         self.model = model
         self.system_prompt = RATING_SYSTEM_PROMPT
-        self._client = anthropic.AsyncAnthropic()
+        self._client = genai.Client(
+            vertexai=True, project=_GCP_PROJECT, location=_GCP_REGION
+        )
 
     @property
     def role(self) -> AgentRole:
@@ -102,27 +99,27 @@ class RatingAgent(BaseAgent):
         query: ClientQuery,
         prior_responses: list[AgentResponse],
     ) -> AgentResponse:
-        """
-        Evaluate the full pipeline run and return a score + recommendations.
-        """
+        """Evaluate the full pipeline run and return a score + recommendations."""
         self._logger.info(f"Rating pipeline run for query: '{query.text[:80]}'")
 
         pipeline_summary = self._build_summary(query, prior_responses)
 
-        api_response = await self._client.messages.create(
+        response = await self._client.aio.models.generate_content(
             model=self.model,
-            max_tokens=_MAX_TOKENS,
-            system=self.system_prompt,
-            messages=[{"role": "user", "content": pipeline_summary}],
-            output_config={"format": {"type": "json_schema", "schema": _RATING_SCHEMA}},
+            contents=pipeline_summary,
+            config=types.GenerateContentConfig(
+                system_instruction=self.system_prompt,
+                max_output_tokens=_MAX_TOKENS,
+                response_mime_type="application/json",
+                response_schema=_RATING_SCHEMA,
+            ),
         )
 
-        raw_json = next(
-            (b.text for b in api_response.content if b.type == "text"), "{}"
-        )
-        result = json.loads(raw_json)
+        if not response.text:
+            raise ValueError("Empty response from model — will retry")
+        result = json.loads(response.text)
 
-        score = ProcessScore(int(result["score"]))
+        score = ProcessScore(max(1, min(5, int(result["score"]))))
         rating = RatingResult(
             score=score,
             justification=result.get("justification", ""),
@@ -148,17 +145,15 @@ class RatingAgent(BaseAgent):
                 "model": self.model,
                 "pipeline_summary_length": len(pipeline_summary),
                 "needs_escalation": rating.needs_escalation,
-                "input_tokens": api_response.usage.input_tokens,
-                "output_tokens": api_response.usage.output_tokens,
+                "input_tokens": response.usage_metadata.prompt_token_count,
+                "output_tokens": response.usage_metadata.candidates_token_count,
             },
         )
-
-    # ── Private helpers ───────────────────────────────────────────────────────
 
     def _build_summary(
         self, query: ClientQuery, prior_responses: list[AgentResponse]
     ) -> str:
-        """Build a text summary of the full pipeline run for the LLM to evaluate."""
+        """Build a text summary of the full pipeline run for Gemini to evaluate."""
         parts = [f"Client Query: {query.text}\n"]
         for r in prior_responses:
             parts.append(f"--- {r.agent_role.value.upper()} AGENT ---")
