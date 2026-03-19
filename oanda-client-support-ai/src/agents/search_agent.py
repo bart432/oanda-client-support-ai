@@ -3,10 +3,11 @@ SearchAgent — crawls OANDA Help Center pages to find content relevant
 to the client's query.
 
 Crawl strategy:
-    1. BFS from OANDA_HELP_BASE, following links within help.oanda.com/us/en/
-    2. Per-page content is extracted with BeautifulSoup (nav/footer stripped)
-    3. Pages are ranked against the query with a TF-IDF score
-    4. Top-k (default 5) results are returned with title, URL, and excerpt
+    1. Any URLs embedded in the query are fetched first as priority sources.
+    2. BFS from OANDA_HELP_BASE, following links within help.oanda.com/us/en/
+    3. Per-page content is extracted with BeautifulSoup (nav/footer stripped)
+    4. The query is expanded with domain synonyms before TF-IDF scoring
+    5. Top-k (default 5) results are returned with title, URL, and excerpt
 
 Caching:
     Module-level dict keyed by URL; entries expire after _CACHE_TTL seconds
@@ -60,6 +61,40 @@ _STOP_WORDS = frozenset(
         "s", "re", "ve", "ll", "d", "t",
     }
 )
+
+# ── Customer-service synonym expansion ────────────────────────────────────────
+# Maps common support intent phrases → additional search tokens to inject.
+# Keys are matched case-insensitively as substrings of the query.
+_QUERY_EXPANSIONS: list[tuple[str, list[str]]] = [
+    # Account access / credentials
+    ("password",        ["password", "reset", "login", "credentials", "forgot"]),
+    ("reset password",  ["password", "reset", "change", "forgot", "email", "link"]),
+    ("forgot password", ["password", "reset", "forgot", "email", "recover"]),
+    ("login",           ["login", "sign", "access", "credentials", "account"]),
+    ("sign in",         ["login", "sign", "access", "credentials"]),
+    ("locked",          ["locked", "blocked", "access", "account", "unlock"]),
+    # Account management
+    ("open account",    ["open", "account", "register", "signup", "create"]),
+    ("close account",   ["close", "account", "terminate", "cancel"]),
+    ("verify",          ["verify", "verification", "identity", "kyc", "document"]),
+    ("document",        ["document", "upload", "verify", "identity", "proof"]),
+    # Deposits / withdrawals
+    ("deposit",         ["deposit", "fund", "transfer", "bank", "payment"]),
+    ("withdraw",        ["withdraw", "withdrawal", "transfer", "bank", "funds"]),
+    ("transfer",        ["transfer", "funds", "deposit", "withdraw", "bank"]),
+    # Trading
+    ("spread",          ["spread", "cost", "commission", "pricing"]),
+    ("leverage",        ["leverage", "margin", "ratio"]),
+    ("margin",          ["margin", "leverage", "call", "close"]),
+    ("order",           ["order", "trade", "entry", "market", "limit", "stop"]),
+    ("platform",        ["platform", "mt4", "mt5", "fxtrade", "app", "download"]),
+    # Fees / costs
+    ("fee",             ["fee", "cost", "charge", "commission", "pricing"]),
+    ("commission",      ["commission", "fee", "cost", "pricing"]),
+]
+
+# Regex to extract bare URLs from text
+_URL_RE = re.compile(r'https?://[^\s\'"<>]+', re.IGNORECASE)
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
@@ -133,11 +168,15 @@ class SearchAgent(BaseAgent):
         """
         Crawl OANDA Help Center (or use cache), rank pages by TF-IDF, and
         return the top-k excerpts with source URLs.
+
+        Priority sources:
+            Any URLs found directly in the query text are fetched first and
+            pinned at the top of the result list regardless of TF-IDF score.
         """
         self._logger.info(f"Searching for: '{query.text[:80]}'")
 
         loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
+        results, inline_urls = await loop.run_in_executor(
             None, partial(self._search, query.text)
         )
 
@@ -159,18 +198,83 @@ class SearchAgent(BaseAgent):
             content=content,
             confidence=min(1.0, len(results) / self.top_k),
             sources=sources,
-            metadata={"num_results": len(results), "query": query.text},
+            metadata={
+                "num_results": len(results),
+                "query": query.text,
+                "expanded_query": self._expand_query(query.text),
+                "inline_urls": inline_urls,
+            },
         )
 
     # ── Core pipeline ─────────────────────────────────────────────────────────
 
-    def _search(self, query_text: str) -> list[dict]:
-        """Synchronous: crawl → rank → return top-k."""
-        pages = self._crawl_sitemap()
-        if not pages:
+    def _search(self, query_text: str) -> tuple[list[dict], list[str]]:
+        """
+        Synchronous: extract inline URLs → crawl → rank → return top-k.
+
+        Returns (results, inline_urls) so the caller can surface which URLs
+        were taken directly from the query.
+        """
+        # 1. Extract any URLs the client embedded in their message
+        inline_urls = _URL_RE.findall(query_text)
+        priority_pages: list[dict] = []
+        priority_urls: set[str] = set()
+
+        for url in inline_urls:
+            page = self._fetch_page(url)
+            if page and url not in priority_urls:
+                priority_pages.append(page)
+                priority_urls.add(url)
+                self._logger.info(f"Priority source from query URL: {url}")
+
+        # 2. Crawl the help center
+        crawled_pages = self._crawl_sitemap()
+        if not crawled_pages and not priority_pages:
             self._logger.warning("Crawl returned no pages.")
-            return []
-        return self._rank_results(query_text, pages)[: self.top_k]
+            return [], inline_urls
+
+        # Merge — priority pages first, then crawled (deduped by URL)
+        seen_urls = set(priority_urls)
+        all_pages = list(priority_pages)
+        for p in crawled_pages:
+            if p["url"] not in seen_urls:
+                all_pages.append(p)
+                seen_urls.add(p["url"])
+
+        # 3. Rank with expanded query
+        expanded = self._expand_query(query_text)
+        ranked = self._rank_results(expanded, all_pages)
+
+        # 4. Pin priority pages at the top (if they scored > 0), then fill
+        priority_scored = [r for r in ranked if r["url"] in priority_urls]
+        others = [r for r in ranked if r["url"] not in priority_urls]
+        combined = priority_scored + others
+
+        return combined[: self.top_k], inline_urls
+
+    def _expand_query(self, query_text: str) -> str:
+        """
+        Return an augmented query string with domain-specific synonym tokens
+        appended, based on intent phrases found in the original query.
+        """
+        lower = query_text.lower()
+        extra_tokens: list[str] = []
+        for phrase, expansions in _QUERY_EXPANSIONS:
+            if phrase in lower:
+                extra_tokens.extend(expansions)
+
+        if not extra_tokens:
+            return query_text
+
+        # Deduplicate while preserving order
+        seen: set[str] = set(_tokenize(query_text))
+        unique_extras = []
+        for tok in extra_tokens:
+            if tok not in seen:
+                unique_extras.append(tok)
+                seen.add(tok)
+
+        return query_text + " " + " ".join(unique_extras)
 
     def _fetch_page(self, url: str) -> dict | None:
         """
